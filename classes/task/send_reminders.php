@@ -103,7 +103,7 @@ class send_reminders extends \core\task\scheduled_task {
             mtrace("Block {$instance->id}: threshold {$threshold}, frequency {$frequency}.");
 
             $coursecontext = context_course::instance($courseid);
-            $progressbase = (new completion_progress($course))->for_block_instance($instance);
+            $progressbase = (new completion_progress($course))->for_overview()->for_block_instance($instance);
             if (!$progressbase->get_completion_info()->is_enabled()) {
                 mtrace("Skipping block {$instance->id}: completion disabled in course.");
                 continue;
@@ -112,19 +112,44 @@ class send_reminders extends \core\task\scheduled_task {
                 mtrace("Skipping block {$instance->id}: no activities.");
                 continue;
             }
+            $progressbase->compute_overview_percentages();
 
-            $users = get_enrolled_users($coursecontext, '', 0, 'u.*', '', 0, 0, true);
-            if (!$users) {
-                mtrace("Skipping block {$instance->id}: no enrolled users.");
-                continue;
+            $groupids = $this->get_group_ids_for_filter($blockconfig->group ?? '0', $courseid);
+            $enrolsql = get_enrolled_join($coursecontext, 'u.id', false);
+            $groupjoin = '';
+            $groupwhere = '';
+            $groupparams = [];
+            if (!empty($groupids)) {
+                list($grouptoken, $groupparams) = $DB->get_in_or_equal($groupids, SQL_PARAMS_NAMED, 'gid');
+                $groupjoin = "JOIN {groups_members} gm ON gm.userid = u.id AND gm.groupid {$grouptoken}";
             }
-            mtrace("Block {$instance->id}: enrolled users " . count($users) . ".");
+
+            $cachetime = get_config('block_completion_progress', 'overviewcachetime') ?: defaults::OVERVIEWCACHETIME;
+            $cachemin = time() - $cachetime;
+            $sql = "SELECT u.*, b.percentage
+                      FROM {user} u {$enrolsql->joins}
+                      {$groupjoin}
+                      JOIN {block_completion_progress} b
+                        ON b.userid = u.id
+                       AND b.blockinstanceid = :bi
+                       AND b.timemodified > :cachemin
+                     WHERE {$enrolsql->wheres}
+                       AND b.percentage IS NOT NULL
+                       AND b.percentage < :threshold";
+            $params = $enrolsql->params + $groupparams + [
+                'bi' => $instance->id,
+                'cachemin' => $cachemin,
+                'threshold' => $threshold,
+            ];
+
+            $recordset = $DB->get_recordset_sql($sql, $params);
+            $recipients = 0;
 
             $courseurl = new moodle_url('/course/view.php', ['id' => $courseid]);
             $coursename = format_string($course->fullname, true, ['context' => $coursecontext]);
             $sentany = false;
 
-            foreach ($users as $user) {
+            foreach ($recordset as $user) {
                 if (!has_capability('block/completion_progress:showbar', $blockcontext, $user->id)) {
                     mtrace("Block {$instance->id}: user {$user->id} skipped: no showbar capability.");
                     continue;
@@ -133,29 +158,12 @@ class send_reminders extends \core\task\scheduled_task {
                     mtrace("Block {$instance->id}: user {$user->id} skipped: has overview capability.");
                     continue;
                 }
-                if (!$this->user_matches_group($blockconfig->group ?? '0', $courseid, $user->id)) {
-                    mtrace("Block {$instance->id}: user {$user->id} skipped: not in group filter.");
-                    continue;
-                }
-
-                $progress = clone $progressbase;
-                $progress->for_user($user);
-                if (!$progress->has_visible_activities()) {
-                    mtrace("Block {$instance->id}: user {$user->id} skipped: no visible activities.");
-                    continue;
-                }
-
-                $percent = $progress->get_percentage();
-                if ($percent === null || $percent >= $threshold) {
-                    $val = $percent === null ? 'null' : (string)$percent;
-                    mtrace("Block {$instance->id}: user {$user->id} skipped: percent {$val}.");
-                    continue;
-                }
+                $recipients++;
 
                 $data = (object)[
                     'firstname' => $user->firstname,
                     'coursename' => $coursename,
-                    'percent' => $percent,
+                    'percent' => $user->percentage,
                     'courseurl' => $courseurl->out(false),
                 ];
                 $subject = get_string('reminderemailsubject', 'block_completion_progress', $data);
@@ -168,6 +176,8 @@ class send_reminders extends \core\task\scheduled_task {
                     $sentany = true;
                 }
             }
+            $recordset->close();
+            mtrace("Block {$instance->id}: recipients {$recipients}.");
 
             if ($sentany) {
                 $blockconfig->reminderlastsent = time();
@@ -252,5 +262,29 @@ class send_reminders extends \core\task\scheduled_task {
         }
 
         return true;
+    }
+
+    /**
+     * Resolve group/grouping filter into a list of group IDs.
+     * @param string $group
+     * @param int $courseid
+     * @return array
+     */
+    private function get_group_ids_for_filter(string $group, int $courseid): array {
+        if ($group === '0' || $group === '') {
+            return [];
+        }
+        if ((substr($group, 0, 6) === 'group-') && ($groupid = (int)substr($group, 6))) {
+            return [$groupid];
+        }
+        if ((substr($group, 0, 9) === 'grouping-') && ($groupingid = (int)substr($group, 9))) {
+            $groups = groups_get_all_groups($courseid, 0, $groupingid);
+            if (!$groups) {
+                return [];
+            }
+            return array_map('intval', array_keys($groups));
+        }
+
+        return [];
     }
 }
